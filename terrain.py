@@ -86,7 +86,9 @@ def classify_dem(dem):
         "e < 100 ? 0 : e < 200 ? 1 : e < 400 ? 2 : e < 600 ? 3 : e < 800 ? 4 : "
         "e < 1200 ? 5 : e < 1600 ? 6 : e < 2200 ? 7 : e < 3000 ? 8 : 9"
     )
-    return e.expression(equation, {"e": e}).rename("class")
+    # See classify_standard() in indices.py - .expression()'s ternary does not
+    # reliably propagate the mask through tile rendering, so it's reapplied here.
+    return e.expression(equation, {"e": e}).rename("class").updateMask(e.mask())
 
 
 SLOPE_PALETTE = ["#1a9850", "#a6d96a", "#fdae61", "#d73027"]
@@ -101,7 +103,7 @@ SLOPE_LABELS = [
 def classify_slope(slope):
     s = slope.rename("s")
     equation = "s < 2 ? 0 : s < 5 ? 1 : s < 10 ? 2 : 3"
-    return s.expression(equation, {"s": s}).rename("class")
+    return s.expression(equation, {"s": s}).rename("class").updateMask(s.mask())
 
 
 # Compass classes shared by aspect AND flow direction (both are "which way is
@@ -122,7 +124,7 @@ def classify_aspect(aspect):
         "a < 0 ? 8 : a < 22.5 ? 0 : a < 67.5 ? 1 : a < 112.5 ? 2 : a < 157.5 ? 3 : "
         "a < 202.5 ? 4 : a < 247.5 ? 5 : a < 292.5 ? 6 : a < 337.5 ? 7 : 0"
     )
-    return a.expression(equation, {"a": a}).rename("class")
+    return a.expression(equation, {"a": a}).rename("class").updateMask(a.mask())
 
 
 # MERIT Hydro D8 codes (ESRI convention): 1=E 2=SE 4=S 8=SW 16=W 32=NW 64=N 128=NE.

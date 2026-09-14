@@ -181,7 +181,12 @@ def classify_standard(image):
         "idx < 0.7 ? 7 : "
         "idx < 0.8 ? 8 : 9"
     )
-    return idx.expression(equation, {"idx": idx}).rename("class")
+    # ee.Image.expression()'s ternary conditional does not reliably propagate
+    # the input mask through tile rendering (confirmed via actual tile pixel
+    # inspection - masked areas render as an opaque, arbitrarily-classified
+    # color instead of staying transparent), so the mask must be re-applied
+    # explicitly rather than trusted to carry over on its own.
+    return idx.expression(equation, {"idx": idx}).rename("class").updateMask(idx.mask())
 
 
 VEGETATION_INDICES = {"NDVI", "GNDVI", "NDRE", "EVI", "SAVI", "MSAVI", "MTCI", "NDVI_SAR"}
