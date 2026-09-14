@@ -138,7 +138,9 @@ def get_true_color(image, bands=S2_BANDS):
     ).rename(["R", "G", "B"])
 
 
-TRUE_COLOR_VIS = {"min": 0, "max": 3000, "gamma": 1.4}
+# Reflectance here is physical (0-1) scale, not raw 0-10000 DN - the optical
+# composite (_optical_image in api.py) divides by 10000 before this is called.
+TRUE_COLOR_VIS = {"min": 0, "max": 0.3, "gamma": 1.4}
 
 
 # Indices computed from a single composite image, signature (image, bands).

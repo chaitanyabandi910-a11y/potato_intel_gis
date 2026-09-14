@@ -21,11 +21,11 @@ Potato Intel platform.
 | NDMI | Moisture | Sentinel-2 | `(N - S1) / (N + S1)` |
 | LSWI | Moisture | Sentinel-2 | `(N - S2) / (N + S2)` |
 | SM_RELATIVE | Moisture | Sentinel-1 | Wagner change-detection: temporal min/max normalization of VV backscatter, `[0, 1]` |
+| TRUE_COLOR | — | Sentinel-2 | RGB composite (visualization only, not a derived index — no classification/legend) |
 
 Band aliases (`N`, `R`, `G`, `B`, `RE1`, `RE2`, `S1`, `S2`, …) map to Sentinel-2
 SR band names in `S2_BANDS`, and `VV`/`VH` map to Sentinel-1 GRD in `S1_BANDS`
-— see [`indices.py`](indices.py). `get_true_color()` is also available for an
-RGB composite (visualization only, not a derived index).
+— see [`indices.py`](indices.py).
 
 ### Classification / legend scheme
 
@@ -83,7 +83,11 @@ Liveness check → `{"status": "ok"}`.
 
 ### `GET /api/indices`
 Lists all available index keys, e.g.
-`{"indices": ["EVI", "GNDVI", "LSWI", ...]}`.
+`{"indices": ["EVI", "GNDVI", "LSWI", ..., "TRUE_COLOR"]}`.
+
+### `GET /api/terrain/layers`
+Lists the terrain layer keys returned by the DEM endpoint below:
+`{"layers": ["dem", "slope", "aspect", "flow_direction", "flow_accumulation", "twi"]}`.
 
 ### `POST /api/index`
 Computes one index over an AOI and returns a tile URL for map display.
@@ -269,16 +273,16 @@ forwards `tile_url` (+ `vis_params`/`labels`) to the frontend map.
 const axios = require('axios');
 
 const INDEX_API_URL = process.env.INDEX_API_URL || 'http://127.0.0.1:5000';
+const INDEX_API_KEY = process.env.INDEX_API_KEY; // set only if the service has API_KEY enabled
+
+const indexApiHeaders = INDEX_API_KEY ? { 'X-API-Key': INDEX_API_KEY } : {};
 
 async function getIndexTile({ index, aoi, startDate, endDate, cloud, orbitPass }) {
-  const { data } = await axios.post(`${INDEX_API_URL}/api/index`, {
-    index,
-    aoi,
-    start_date: startDate,
-    end_date: endDate,
-    cloud,
-    orbit_pass: orbitPass,
-  });
+  const { data } = await axios.post(
+    `${INDEX_API_URL}/api/index`,
+    { index, aoi, start_date: startDate, end_date: endDate, cloud, orbit_pass: orbitPass },
+    { headers: indexApiHeaders },
+  );
   return data; // { index, tile_url, vis_params, labels }
 }
 
@@ -373,22 +377,111 @@ const data = await res.json();
   can point at different hosts for this service without code changes.
 - `GET /api/indices` is handy to populate a dropdown or validate `indexName`
   before calling `/api/index`.
-- This Flask service already sends permissive CORS headers (`flask-cors`)
-  for local development — if Node is the only caller (recommended), you can
-  tighten or remove that once deployed, since server-to-server calls aren't
-  subject to CORS anyway.
+- If the service has `API_KEY` set (see [Production readiness](#production-readiness)),
+  every call from Node needs the `X-API-Key` header, as shown above.
+- CORS is open by default (fine for local dev) but configurable via
+  `ALLOWED_ORIGINS` - moot for Node-to-Node calls either way, since CORS is a
+  browser-only mechanism and doesn't apply to server-to-server requests.
 - Earth Engine calls can take a few seconds; don't block a user-facing
   request on this synchronously without a loading state / timeout on the
   Node side.
 
+## Production readiness
+
+This service went through a hardening pass beyond the happy path. What's
+covered and what's still your responsibility:
+
+### Error handling
+
+Every error response is JSON: `{"error": "..."}`. Status codes:
+
+| Status | Meaning |
+|---|---|
+| 400 | Bad input - missing/malformed field, invalid GeoJSON, bad date, cloud out of range, unknown `orbit_pass`, unknown index, AOI over the area cap, malformed request body |
+| 401 | Missing/wrong `X-API-Key` (only enforced if `API_KEY` is set - see below) |
+| 404 | Unknown route |
+| 413 | Request body over `MAX_CONTENT_LENGTH` (2MB) |
+| 422 | Valid request, but no data for it (e.g. a DEM boundary entirely over open ocean) |
+| 500 | Unexpected internal error (logged server-side; message is generic, no internals leaked) |
+
+Earth Engine's own exceptions (bad geometry EE itself rejects, no imagery
+found, etc.) are caught and surfaced as 400s with EE's own descriptive
+message - safe to expose, these are about the request, not the server.
+
+### Input validation
+
+Before anything touches Earth Engine: `start_date`/`end_date` must be real
+`YYYY-MM-DD` dates, `cloud` must be numeric in `[0, 100]`, `orbit_pass` (if
+given) must be `ASCENDING`/`DESCENDING`, `aoi`/`boundary` must be a
+`Point`/`Polygon`/`MultiPolygon` GeoJSON geometry with a non-empty
+`coordinates` array, and its bounding box must be under `MAX_AOI_AREA_KM2`
+(default 5000 km² - a pure-Python bbox estimate, no extra EE round-trip,
+just a coarse cost/abuse cap). `farm_id` must be non-empty and ≤128 chars.
+
+### Auth & CORS
+
+Both are opt-in via env vars so local dev stays frictionless, but should be
+set in any deployment reachable outside your own network:
+
+- **`API_KEY`** - if set, every route except `/health` requires a matching
+  `X-API-Key` header, or it 401s. Unset by default (open access), since this
+  is meant to run behind Node on a private network in most deployments - but
+  set it if the service has any public exposure at all, since an unauthenticated
+  instance lets anyone run billable Earth Engine computations through it.
+- **`ALLOWED_ORIGINS`** - comma-separated list of allowed origins for CORS
+  (e.g. `https://app.potatointel.com,https://staging.potatointel.com`). If
+  unset, CORS allows any origin (fine for local dev with the browser tester,
+  not fine in production if browsers ever call this directly - Node-to-Node
+  calls aren't subject to CORS at all, so this only matters if a frontend
+  calls this service directly).
+
+### Other config (env vars, all optional)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `GEE_SERVICE_ACCOUNT_FILE` | `credentials/service-account.json` | path to the GEE key |
+| `API_KEY` | unset (disabled) | shared-secret auth, see above |
+| `ALLOWED_ORIGINS` | unset (any origin) | CORS allowlist, see above |
+| `MAX_AOI_AREA_KM2` | `5000` | reject AOIs with a larger bounding box |
+| `FLASK_DEBUG` | `false` | **never enable in production** - turns on Werkzeug's interactive debugger, which allows arbitrary code execution if an unhandled exception is hit and the debugger PIN leaks |
+| `HOST` | `127.0.0.1` | bind address for `python api.py` (use `0.0.0.0` in a container) |
+| `PORT` | `5000` | bind port for `python api.py` |
+
+`MAX_CONTENT_LENGTH` (request body cap, 2MB) isn't an env var - it's generous
+for any real GeoJSON boundary; change it directly in `api.py` if you have an
+unusual case.
+
+### Logging
+
+Basic structured logging is configured (`logging.basicConfig`, INFO level).
+Unexpected errors are logged server-side with full tracebacks
+(`logger.exception`) even though the client only sees a generic 500 message.
+
+### What's still on you
+
+- **Rate limiting** isn't implemented in-process - put this behind a gateway/
+  reverse proxy (or Node itself) that rate-limits if it's reachable outside
+  a trusted network, since each request can trigger real Earth Engine compute.
+- **Concurrency**: run gunicorn with multiple **worker processes** (`-w N`),
+  not threads within one process - the earthengine-api client isn't verified
+  thread-safe for concurrent use within a single process, but separate
+  worker processes each get their own clean `ee.Initialize()` at import time.
+- **Secrets**: `credentials/service-account.json` should never end up in an
+  image layer or repo - inject it at deploy time (mounted secret, volume, or
+  point `GEE_SERVICE_ACCOUNT_FILE` at wherever your platform puts it).
+- **Monitoring/alerting** on 5xx rates and Earth Engine quota usage is outside
+  this service's scope - add it at whatever layer you already use for the
+  rest of Potato Intel.
+
 ## Deployment
 
-The dev server (`app.run(debug=True)`) is not for production. Run it with a
-real WSGI server instead, e.g.:
+The dev server (`app.run()`) is not for production regardless of `FLASK_DEBUG`.
+Run it with a real WSGI server:
 
 ```bash
 pip install gunicorn
-gunicorn -w 2 -b 0.0.0.0:5000 api:app
+API_KEY=... ALLOWED_ORIGINS=https://app.potatointel.com \
+  gunicorn -w 2 -b 0.0.0.0:5000 api:app
 ```
 
 Keep `credentials/service-account.json` off the machine image / repo and
