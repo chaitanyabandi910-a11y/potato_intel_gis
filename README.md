@@ -430,10 +430,9 @@ set in any deployment reachable outside your own network:
   instance lets anyone run billable Earth Engine computations through it.
 - **`ALLOWED_ORIGINS`** - comma-separated list of allowed origins for CORS
   (e.g. `https://app.potatointel.com,https://staging.potatointel.com`). If
-  unset, CORS allows any origin (fine for local dev with the browser tester,
-  not fine in production if browsers ever call this directly - Node-to-Node
-  calls aren't subject to CORS at all, so this only matters if a frontend
-  calls this service directly).
+  unset, CORS allows any origin (fine for local dev, not fine in production
+  if browsers ever call this directly - Node-to-Node calls aren't subject to
+  CORS at all, so this only matters if a frontend calls this service directly).
 
 ### Other config (env vars, all optional)
 
