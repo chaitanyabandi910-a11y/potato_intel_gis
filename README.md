@@ -1,11 +1,15 @@
-# Potato Intel — GEE Vegetation & Radar Indices API
+# Potato Intel — GEE Indices & Terrain API
 
-A Flask API that computes vegetation/water/radar indices from Google Earth
-Engine (Sentinel-1/Sentinel-2) for a given AOI and date range, returning a
-ready-to-use XYZ tile URL for map display. Built for integration into the
-Potato Intel platform.
+A Flask API that computes vegetation/water/radar indices and static terrain
+layers (DEM, slope, aspect, flow direction/accumulation, TWI) from Google
+Earth Engine, returning ready-to-use XYZ tile URLs for map display. Both are
+served from the same app (`api.py`) — one process, one port. Built for
+integration into the Potato Intel platform.
 
 ## Indices
+
+Computed via `POST /api/index` over an AOI + date range (satellite imagery,
+so it varies over time).
 
 | Index | Group | Source | Formula |
 |---|---|---|---|
@@ -36,6 +40,23 @@ steps by `classify_standard()`, then colored with a shared 10-color palette
 per group (`VEGETATION_PALETTE`/`VEGETATION_LABELS` or
 `MOISTURE_PALETTE`/`MOISTURE_LABELS`). This is what `/api/index` returns as
 `vis_params` + `labels`.
+
+## Terrain layers
+
+Computed via `POST /api/farms/<farm_id>/dem/generate` over a farm boundary —
+no date range, since terrain is static (unlike satellite imagery). Full
+request/response details in [Terrain (DEM) API](#terrain-dem-api) below.
+
+| Layer | Source | What it is |
+|---|---|---|
+| `dem` | Copernicus DEM GLO-30 | Elevation (m) |
+| `slope` | derived from `dem` | Slope, classified `Very Flat`/`Gentle`/`Moderate`/`Steep` |
+| `aspect` | derived from `dem` | Compass direction the surface faces (8 directions + Flat) |
+| `flow_direction` | MERIT Hydro | D8 flow direction, same 8-compass + Flat scheme as `aspect` |
+| `flow_accumulation` | MERIT Hydro | Upstream drainage area (km²), log-scaled for display |
+| `twi` | derived from `dem` + MERIT Hydro | Topographic Wetness Index, `ln(As / tan(slope))` |
+
+See [`terrain.py`](terrain.py) for the implementation.
 
 ## Project layout
 
