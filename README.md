@@ -42,7 +42,8 @@ per group (`VEGETATION_PALETTE`/`VEGETATION_LABELS` or
 ```
 Functions/
 ├── api.py                   # Flask API
-├── indices.py                # Index functions + band maps + classification/palettes
+├── indices.py                # Vegetation/moisture/radar index functions + palettes
+├── terrain.py                 # DEM/slope/aspect/flow/TWI terrain functions + palettes
 ├── config/
 │   └── ee_auth.py           # GEE service-account auth (initializes on import)
 ├── credentials/
@@ -143,6 +144,108 @@ single orbit pass (explicit or auto-fallback).
 No changes to `api.py` are needed beyond that — `/api/indices` and
 `/api/index` pick up new entries automatically.
 
+## Terrain (DEM) API
+
+Static terrain layers derived from Copernicus DEM GLO-30 (elevation/slope/
+aspect) and MERIT Hydro (flow direction/accumulation, TWI) — one call per
+farm boundary, no date range (terrain doesn't change like satellite imagery).
+
+### `POST /api/farms/<farm_id>/dem/generate`
+
+Request body:
+```json
+{
+  "boundary": {
+    "type": "Polygon",
+    "coordinates": [[[73.75, 20.00], [73.76, 20.00], [73.76, 20.01], [73.75, 20.01], [73.75, 20.00]]]
+  }
+}
+```
+`boundary` is any GeoJSON Polygon or MultiPolygon.
+
+Response:
+```json
+{
+  "farm_id": "FARM123",
+  "source": "Copernicus DEM GLO-30",
+  "resolution": "30m",
+  "boundary_hash": "571b08ba9e9eaf5f4f8f1eba981afcec687ccb13251db476d12a3ff775adc7fb",
+  "layers": {
+    "dem": "https://earthengine.googleapis.com/.../tiles/{z}/{x}/{y}",
+    "slope": "...",
+    "aspect": "...",
+    "flow_direction": "...",
+    "flow_accumulation": "...",
+    "twi": "..."
+  },
+  "legends": {
+    "dem": { "vis_params": { "min": 0, "max": 9, "palette": ["#006400", "..."] }, "labels": ["0-100 m | Very Low Elevation", "..."] },
+    "slope": { "vis_params": {...}, "labels": ["0-2° | Very Flat", "..."] },
+    "aspect": { "vis_params": {...}, "labels": ["North", "North-East", "...", "Flat"] },
+    "flow_direction": { "vis_params": {...}, "labels": ["North", "...", "Flat"] },
+    "flow_accumulation": { "vis_params": { "min": 0, "max": 15, "palette": ["#f7fbff", "..."] }, "labels": null },
+    "twi": { "vis_params": {...}, "labels": ["0-2 | Very Low Wetness Tendency", "..."] }
+  },
+  "statistics": {
+    "min_elevation": 589.5,
+    "max_elevation": 622.98,
+    "avg_elevation": 602.74,
+    "mean_slope": 3.42,
+    "max_slope": 14.04,
+    "dominant_aspect": "North"
+  }
+}
+```
+
+`layers.*` are XYZ tile templates (same as `/api/index`'s `tile_url`) — drop
+straight into a map. `legends.*` gives you the vis params + labels to render
+each layer's legend on the dashboard toggle list.
+
+**How each layer is derived:**
+- `dem` / `slope` / `aspect`: Copernicus DEM GLO-30, `ee.Terrain.slope`/
+  `.aspect()`. GLO-30 is tiled with no single native projection, so the
+  mosaic is pinned to a real ~30m grid (`setDefaultProjection`) *before*
+  slope/aspect are derived — skipping this silently breaks both (near-zero
+  slope, fully masked once clipped).
+- `flow_direction` / `flow_accumulation`: MERIT Hydro's precomputed D8 flow
+  direction (`dir` band) and upstream drainage area in km² (`upa` band) —
+  this is a real global hydrological computation, not re-derived per farm
+  boundary, so a small field near a large drainage network can correctly
+  show high flow accumulation even though the "flow" happens far upstream.
+- `twi` = `ln(As / tan(slope))` per the spec, with `As` = MERIT Hydro's `upa`
+  (converted km² → m²).
+- `flow_direction` and `aspect` share the same 8-compass-direction + "Flat"
+  classification/palette (`ASPECT_LABELS`/`ASPECT_PALETTE` in `terrain.py`),
+  since both are fundamentally "which way does this pixel face/drain".
+
+### Caching — what's this service's job vs. the main backend's
+
+This endpoint is **stateless**: every call recomputes and returns fresh tile
+URLs. That's intentional and cheap — `getMapId` doesn't do the actual
+raster computation, it just returns a tile template that Earth Engine
+computes lazily per tile as the map is panned/zoomed.
+
+The *"don't reprocess DEM for a farm whose boundary hasn't changed"* caching
+described in the original spec belongs in the Node.js backend + its own
+database, not here — this Python service has no database and shouldn't need
+one for a static-per-boundary computation. The split:
+
+- **This service** computes `boundary_hash` (`sha256` of the boundary
+  GeoJSON, `json.dumps(..., sort_keys=True, separators=(",", ":"))` before
+  hashing — see `compute_boundary_hash()` in `terrain.py`) and returns it in
+  the response so Node can store it as-is.
+- **Node + Postgres** (or whatever the main DB is) owns a `farm_dem_layers`
+  table (`farm_id`, `dem_source`, `dem_resolution`, the 6 `*_raster_url`
+  columns, the statistics columns, `boundary_hash`, `created_at`,
+  `updated_at` — as in the original spec) and implements the actual cache
+  check: hash the incoming boundary the same way, compare to the stored
+  `boundary_hash`, and only call this endpoint when they differ (or none is
+  stored yet). Since GeoJSON round-trips through JSON identically in both
+  languages, hashing the same canonical JSON string in Node (`JSON.stringify`
+  with sorted keys) gives the same hash as this service's Python
+  implementation — reimplement the identical canonicalization on the Node
+  side rather than calling into Python just to get a hash.
+
 ## Integrating with a Node.js backend
 
 This API is a separate Python/Flask service — treat it as a microservice
@@ -196,6 +299,62 @@ app.post('/api/fields/:fieldId/index/:indexName', async (req, res) => {
   }
 });
 ```
+
+**Example: the DEM endpoint with the boundary-hash cache check** (the caching
+described in [Terrain (DEM) API](#terrain-dem-api) — this lives in Node, not
+the Python service):
+
+```js
+const crypto = require('crypto');
+
+function boundaryHash(boundaryGeoJSON) {
+  // Must match terrain.py's compute_boundary_hash() canonicalization exactly.
+  const canonical = JSON.stringify(sortKeysDeep(boundaryGeoJSON));
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+app.post('/api/fields/:fieldId/terrain', async (req, res) => {
+  const field = await getFieldGeometry(req.params.fieldId);
+  const hash = boundaryHash(field.geometry);
+
+  const cached = await db.farmDemLayers.findOne({ where: { farm_id: field.id } });
+  if (cached && cached.boundary_hash === hash) {
+    return res.json(cached); // boundary unchanged - skip the GEE call entirely
+  }
+
+  const { data } = await axios.post(
+    `${INDEX_API_URL}/api/farms/${field.id}/dem/generate`,
+    { boundary: field.geometry },
+  );
+
+  await db.farmDemLayers.upsert({
+    farm_id: field.id,
+    dem_source: data.source,
+    dem_resolution: data.resolution,
+    boundary_hash: data.boundary_hash,
+    dem_raster_url: data.layers.dem,
+    slope_raster_url: data.layers.slope,
+    aspect_raster_url: data.layers.aspect,
+    flow_direction_raster_url: data.layers.flow_direction,
+    flow_accumulation_raster_url: data.layers.flow_accumulation,
+    twi_raster_url: data.layers.twi,
+    min_elevation: data.statistics.min_elevation,
+    max_elevation: data.statistics.max_elevation,
+    avg_elevation: data.statistics.avg_elevation,
+    mean_slope: data.statistics.mean_slope,
+    max_slope: data.statistics.max_slope,
+    dominant_aspect: data.statistics.dominant_aspect,
+  });
+
+  res.json(data);
+});
+```
+
+`sortKeysDeep` (recursively sort object keys before stringifying) isn't a
+built-in — use the `json-stable-stringify` npm package instead of hand-rolling
+it, since Python's `sort_keys=True` and a naive JS key-sort can disagree on
+edge cases (nested arrays of objects, key ordering within GeoJSON coordinate
+arrays, etc.) and silently produce a different hash for the same boundary.
 
 **Fetch, if you'd rather avoid the axios dependency:**
 
