@@ -132,15 +132,27 @@ def calculate_SM_RELATIVE(collection, bands=S1_BANDS):
 
 
 # True Color composite (visualization only, not a derived index)
-def get_true_color(image, bands=S2_BANDS):
-    return image.select(
+# aoi is optional - pass it to grey-fill cloud/no-data pixels within the AOI
+# (see classify_standard() for why this needs to distinguish "no data inside
+# the AOI" from "outside the AOI entirely", which must stay transparent).
+def get_true_color(image, bands=S2_BANDS, aoi=None):
+    rgb = image.select(
         [bands.get("R"), bands.get("G"), bands.get("B")]
     ).rename(["R", "G", "B"])
+    if aoi is None:
+        return rgb
+    aoi_mask = ee.Image.constant(1).clip(aoi)
+    grey_fill = ee.Image.constant([NO_DATA_GREY_REFLECTANCE] * 3).rename(["R", "G", "B"])
+    return rgb.unmask(grey_fill).updateMask(aoi_mask)
 
 
 # Reflectance here is physical (0-1) scale, not raw 0-10000 DN - the optical
 # composite (_optical_image in api.py) divides by 10000 before this is called.
 TRUE_COLOR_VIS = {"min": 0, "max": 0.3, "gamma": 1.4}
+
+# Mid-point of TRUE_COLOR_VIS's 0-0.3 stretch, so the grey fill actually
+# renders as neutral grey rather than looking like real (very dark) imagery.
+NO_DATA_GREY_REFLECTANCE = 0.15
 
 
 # Indices computed from a single composite image, signature (image, bands).
@@ -168,9 +180,19 @@ collection_functions = {
 RADAR_INDICES = {"NDVI_SAR", "SM_RELATIVE"}
 
 
+# Grey "no data" class, appended after the 10 real classes (0-9). Used for
+# cloud-masked / otherwise-missing pixels *within* the AOI on the date
+# requested - distinct from outside-the-AOI, which stays fully transparent.
+NO_DATA_CLASS = 10
+NO_DATA_COLOR = "#808080"
+NO_DATA_LABEL = "Clouds"
+
+
 # Buckets a roughly 0-1 index into 10 classes (0-9) on fixed 0.1-wide steps,
-# matching the shared vegetation/moisture classification scheme.
-def classify_standard(image):
+# matching the shared vegetation/moisture classification scheme, then fills
+# any remaining gap *inside* the AOI (cloud, missing scene, etc.) with the
+# grey NO_DATA_CLASS rather than leaving it transparent.
+def classify_standard(image, aoi):
     idx = image.rename("idx")
     equation = (
         "idx <= 0 ? 0 : "
@@ -188,7 +210,14 @@ def classify_standard(image):
     # inspection - masked areas render as an opaque, arbitrarily-classified
     # color instead of staying transparent), so the mask must be re-applied
     # explicitly rather than trusted to carry over on its own.
-    return idx.expression(equation, {"idx": idx}).rename("class").updateMask(idx.mask())
+    classified = idx.expression(equation, {"idx": idx}).rename("class").updateMask(idx.mask())
+
+    # unmask(NO_DATA_CLASS) fills every currently-masked pixel (cloud AND
+    # outside-AOI alike) with grey; updateMask(aoi_mask) then re-masks
+    # everything outside the AOI back to transparent, leaving grey only where
+    # it belongs - genuine no-data *inside* the boundary.
+    aoi_mask = ee.Image.constant(1).clip(aoi)
+    return classified.unmask(NO_DATA_CLASS).updateMask(aoi_mask)
 
 
 VEGETATION_INDICES = {"NDVI", "GNDVI", "NDRE", "EVI", "SAVI", "MSAVI", "MTCI", "NDVI_SAR"}
@@ -197,6 +226,7 @@ MOISTURE_INDICES = {"NDWI", "NDMI", "LSWI", "SM_RELATIVE"}
 VEGETATION_PALETTE = [
     "#8B0000", "#D73027", "#F46D43", "#FDAE61", "#FEE08B",
     "#D9EF8B", "#A6D96A", "#66BD63", "#1A9850", "#006837",
+    NO_DATA_COLOR,
 ]
 VEGETATION_LABELS = [
     "≤ 0.0 | Bare Soil / Water",
@@ -209,11 +239,13 @@ VEGETATION_LABELS = [
     "0.6 - 0.7 | Very Healthy",
     "0.7 - 0.8 | Dense Canopy",
     "0.8 - 1.0 | Very Dense Canopy",
+    NO_DATA_LABEL,
 ]
 
 MOISTURE_PALETTE = [
     "#8c510a", "#bf812d", "#dfc27d", "#f6e8c3", "#c7eae5",
     "#80cdc1", "#35978f", "#01665e", "#2166ac", "#053061",
+    NO_DATA_COLOR,
 ]
 MOISTURE_LABELS = [
     "≤ 0.0 | Extremely Dry",
@@ -226,4 +258,5 @@ MOISTURE_LABELS = [
     "0.6 - 0.7 | Very Wet",
     "0.7 - 0.8 | Water Logged",
     "0.8 - 1.0 | Open Water",
+    NO_DATA_LABEL,
 ]

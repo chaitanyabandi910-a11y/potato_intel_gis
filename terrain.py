@@ -5,7 +5,7 @@ import math
 import ee
 
 from config import ee_auth  # noqa: F401  (initializes ee on import)
-from indices import MOISTURE_PALETTE
+from indices import NO_DATA_CLASS, NO_DATA_COLOR, NO_DATA_LABEL
 
 DEM_SOURCE = "COPERNICUS/DEM/GLO30_2024_1"
 DEM_SOURCE_NAME = "Copernicus DEM GLO-30"
@@ -53,11 +53,30 @@ def get_flow_accumulation(aoi):
     return ee.Image(MERIT_HYDRO).select("upa").clip(aoi).rename("FLOW_ACC")
 
 
+# Static, purely topographic TWI - terrain shape only (upstream area + slope),
+# so it never changes over time. This alone is NOT what /api/index's "TWI"
+# returns - see calculate_dynamic_twi() below, which weights this by actual
+# observed soil moisture for a requested date range.
 def get_twi(aoi, slope):
     upa = ee.Image(MERIT_HYDRO).select("upa").clip(aoi)
     slope_rad = slope.multiply(math.pi / 180)
     tan_slope = slope_rad.tan().max(0.001)  # avoid divide-by-zero on flat terrain
     return upa.multiply(1e6).divide(tan_slope).log().rename("TWI")
+
+
+# Seasonal/dynamic TWI: the static topographic tendency to accumulate water,
+# weighted by how wet the ground actually is right now (sm_relative, 0-1,
+# from indices.calculate_SM_RELATIVE for the caller's chosen date range).
+# A topographically low-lying spot only scores high here if it's *currently*
+# wet; the same spot in a dry period scores low even though the terrain
+# itself hasn't changed. sm_relative's own mask (no radar coverage for the
+# date range) propagates through the multiply, so "no data" here correctly
+# means "no moisture reading for that period," not "bad terrain data."
+def calculate_dynamic_twi(aoi, sm_relative):
+    dem = get_dem(aoi)
+    slope = get_slope(dem)
+    static_twi = get_twi(aoi, slope)
+    return static_twi.multiply(sm_relative).rename("TWI")
 
 
 # --- Classification / legends -----------------------------------------------
@@ -140,7 +159,16 @@ def classify_flow_direction(flow_dir):
 FLOW_ACC_PALETTE = ["#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"]
 FLOW_ACC_VIS = {"min": 0, "max": 15, "palette": FLOW_ACC_PALETTE}  # log1p-scaled
 
-TWI_VIS = {"min": 0, "max": 20, "palette": MOISTURE_PALETTE}
+# Independent copy of the color values, not a reference to indices.py's
+# MOISTURE_PALETTE list object - deliberately sharing NO_DATA_COLOR/LABEL
+# (plain immutable strings, so no risk of the "silently extended shared list"
+# bug that hit this exact palette before), but not the mutable list itself.
+TWI_PALETTE = [
+    "#8c510a", "#bf812d", "#dfc27d", "#f6e8c3", "#c7eae5",
+    "#80cdc1", "#35978f", "#01665e", "#2166ac", "#053061",
+    NO_DATA_COLOR,
+]
+TWI_VIS = {"min": 0, "max": 20, "palette": TWI_PALETTE}
 TWI_LABELS = [
     "0-2 | Very Low Wetness Tendency",
     "2-4 | Low",
@@ -152,7 +180,25 @@ TWI_LABELS = [
     "14-16 | Wet-Prone",
     "16-18 | Highly Wet-Prone",
     "18-20 | Extreme Wetness Tendency",
+    NO_DATA_LABEL,
 ]
+
+
+# Buckets dynamic TWI (0-20 scale) into 10 classes + grey "Clouds" for no
+# soil-moisture reading over the requested date range - same pattern as
+# classify_standard() in indices.py, just with TWI's own value range.
+def classify_twi(image, aoi):
+    idx = image.rename("idx")
+    # 10 buckets matching TWI_LABELS exactly: "0-2"->0, "2-4"->1, ..., "18-20"->9
+    # (unlike classify_standard(), there's no separate "<=0" bucket here - TWI's
+    # own 0-2 bucket already covers zero/near-zero as "Very Low").
+    equation = (
+        "idx < 2 ? 0 : idx < 4 ? 1 : idx < 6 ? 2 : idx < 8 ? 3 : idx < 10 ? 4 : "
+        "idx < 12 ? 5 : idx < 14 ? 6 : idx < 16 ? 7 : idx < 18 ? 8 : 9"
+    )
+    classified = idx.expression(equation, {"idx": idx}).rename("class").updateMask(idx.mask())
+    aoi_mask = ee.Image.constant(1).clip(aoi)
+    return classified.unmask(NO_DATA_CLASS).updateMask(aoi_mask)
 
 
 # --- Statistics --------------------------------------------------------------

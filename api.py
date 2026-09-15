@@ -18,6 +18,7 @@ from indices import (
     VEGETATION_INDICES,
     VEGETATION_LABELS,
     VEGETATION_PALETTE,
+    calculate_SM_RELATIVE,
     classify_standard,
     collection_functions,
     get_true_color,
@@ -35,10 +36,12 @@ from terrain import (
     SLOPE_PALETTE,
     TWI_LABELS,
     TWI_VIS,
+    calculate_dynamic_twi,
     classify_aspect,
     classify_dem,
     classify_flow_direction,
     classify_slope,
+    classify_twi,
     compute_boundary_hash,
     compute_statistics,
     get_aspect,
@@ -46,7 +49,6 @@ from terrain import (
     get_flow_accumulation,
     get_flow_direction,
     get_slope,
-    get_twi,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -70,6 +72,9 @@ MAX_AOI_AREA_KM2 = float(os.getenv("MAX_AOI_AREA_KM2", "5000"))
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
 S2_CLOUD_PROB_COLLECTION = "COPERNICUS/S2_CLOUD_PROBABILITY"
 S1_COLLECTION = "COPERNICUS/S1_GRD"
+
+S2_BAND_NAMES = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
+S1_BAND_NAMES = ["VV", "VH"]
 
 DEFAULT_CLOUD_PROB_THRESHOLD = 40
 
@@ -167,6 +172,25 @@ def _bbox_area_km2(geojson):
 
 # --- Composite builders --------------------------------------------------------
 
+def _ensure_bands(image, band_names):
+    # An empty ImageCollection reduced via .median() produces an image with
+    # NO bands at all (not just masked pixels) - e.g. a date range with zero
+    # matching scenes for this AOI. That crashes any downstream .select()
+    # with a hard EEException instead of gracefully flowing into "no data"
+    # (grey) handling. Guarantee the expected band names exist, fully masked,
+    # whenever that happens.
+    placeholder = ee.Image.constant([0] * len(band_names)).rename(band_names).selfMask()
+    has_bands = image.bandNames().size().gt(0)
+    return ee.Image(ee.Algorithms.If(has_bands, image, placeholder))
+
+
+def _ensure_collection(collection, band_names):
+    placeholder = ee.Image.constant([0] * len(band_names)).rename(band_names).selfMask()
+    return ee.ImageCollection(
+        ee.Algorithms.If(collection.size().gt(0), collection, ee.ImageCollection([placeholder]))
+    )
+
+
 def _optical_image(aoi, start_date, end_date, cloud, cloud_prob_threshold=DEFAULT_CLOUD_PROB_THRESHOLD):
     s2_sr = (
         ee.ImageCollection(S2_COLLECTION)
@@ -199,7 +223,8 @@ def _optical_image(aoi, start_date, end_date, cloud, cloud_prob_threshold=DEFAUL
         )
 
     collection = ee.ImageCollection(joined).map(_mask_clouds)
-    return collection.median().clip(aoi)
+    composite = _ensure_bands(collection.median(), S2_BAND_NAMES)
+    return composite.clip(aoi)
 
 
 def _s1_collection(aoi, start_date, end_date, orbit_pass=None):
@@ -213,30 +238,32 @@ def _s1_collection(aoi, start_date, end_date, orbit_pass=None):
         .select(["VV", "VH"])
     )
     if orbit_pass:
-        return collection.filter(ee.Filter.eq("orbitProperties_pass", orbit_pass))
+        return _ensure_collection(collection.filter(ee.Filter.eq("orbitProperties_pass", orbit_pass)), S1_BAND_NAMES)
 
     # No orbit specified: prefer ASCENDING, fall back to DESCENDING, fall back
     # to whatever's available - some AOIs only get coverage from one pass.
     ascending = collection.filter(ee.Filter.eq("orbitProperties_pass", "ASCENDING"))
     descending = collection.filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
-    return ee.ImageCollection(
+    picked = ee.ImageCollection(
         ee.Algorithms.If(
             ascending.size().gt(0),
             ascending,
             ee.Algorithms.If(descending.size().gt(0), descending, collection),
         )
     )
+    return _ensure_collection(picked, S1_BAND_NAMES)
 
 
 def _radar_image(aoi, start_date, end_date, orbit_pass=None):
-    return _s1_collection(aoi, start_date, end_date, orbit_pass).median().clip(aoi)
+    composite = _ensure_bands(_s1_collection(aoi, start_date, end_date, orbit_pass).median(), S1_BAND_NAMES)
+    return composite.clip(aoi)
 
 
 def _vis_for(index_name):
     if index_name in VEGETATION_INDICES:
-        return {"min": 0, "max": 9, "palette": VEGETATION_PALETTE}, VEGETATION_LABELS, True
+        return {"min": 0, "max": 10, "palette": VEGETATION_PALETTE}, VEGETATION_LABELS, True
     if index_name in MOISTURE_INDICES:
-        return {"min": 0, "max": 9, "palette": MOISTURE_PALETTE}, MOISTURE_LABELS, True
+        return {"min": 0, "max": 10, "palette": MOISTURE_PALETTE}, MOISTURE_LABELS, True
     return DEFAULT_VIS, None, False
 
 
@@ -290,13 +317,17 @@ def health():
 @app.route("/api/indices", methods=["GET"])
 def list_indices():
     return jsonify({
-        "indices": sorted(list(index_functions.keys()) + list(collection_functions.keys()) + ["TRUE_COLOR"]),
+        "indices": sorted(
+            list(index_functions.keys()) + list(collection_functions.keys()) + ["TRUE_COLOR", "TWI"]
+        ),
     })
 
 
 @app.route("/api/terrain/layers", methods=["GET"])
 def list_terrain_layers():
-    return jsonify({"layers": ["dem", "slope", "aspect", "flow_direction", "flow_accumulation", "twi"]})
+    # twi lives on /api/index now (it needs a date range - see TWI's own
+    # comment in compute_index()), not here with the genuinely static layers.
+    return jsonify({"layers": ["dem", "slope", "aspect", "flow_direction", "flow_accumulation"]})
 
 
 @app.route("/api/index", methods=["POST"])
@@ -309,7 +340,7 @@ def compute_index():
     cloud = payload.get("cloud", 20)
     orbit_pass = payload.get("orbit_pass")
 
-    all_indices = set(index_functions) | set(collection_functions) | {"TRUE_COLOR"}
+    all_indices = set(index_functions) | set(collection_functions) | {"TRUE_COLOR", "TWI"}
     if index_name not in all_indices:
         raise ApiError(f"Unknown index '{index_name}'. Available: {sorted(all_indices)}")
     if not aoi_geojson or not start_date or not end_date:
@@ -325,12 +356,29 @@ def compute_index():
 
     if index_name == "TRUE_COLOR":
         image = _optical_image(aoi, start_date, end_date, cloud)
-        result_image = get_true_color(image)
+        result_image = get_true_color(image, aoi=aoi)
         map_id = result_image.getMapId(TRUE_COLOR_VIS)
         return jsonify({
             "index": "TRUE_COLOR",
             "tile_url": map_id["tile_fetcher"].url_format,
             "vis_params": TRUE_COLOR_VIS,
+        })
+
+    if index_name == "TWI":
+        # Dynamic/seasonal TWI: static topographic tendency (terrain.get_twi)
+        # weighted by actual observed soil moisture for this date range - see
+        # calculate_dynamic_twi()'s docstring in terrain.py. Needs Sentinel-1
+        # (for soil moisture) like the other radar-based indices.
+        s1_collection = _s1_collection(aoi, start_date, end_date, orbit_pass)
+        sm_relative = calculate_SM_RELATIVE(s1_collection)
+        dynamic_twi = calculate_dynamic_twi(aoi, sm_relative)
+        classified = classify_twi(dynamic_twi, aoi)
+        map_id = classified.getMapId(TWI_VIS)
+        return jsonify({
+            "index": "TWI",
+            "tile_url": map_id["tile_fetcher"].url_format,
+            "vis_params": TWI_VIS,
+            "labels": TWI_LABELS,
         })
 
     if index_name in collection_functions:
@@ -344,7 +392,7 @@ def compute_index():
         result_image = index_functions[index_name](image)
 
     vis_params, labels, classified = _vis_for(index_name)
-    tile_source = classify_standard(result_image) if classified else result_image
+    tile_source = classify_standard(result_image, aoi) if classified else result_image
     map_id = tile_source.getMapId(vis_params)
 
     response = {
@@ -378,7 +426,6 @@ def generate_dem(farm_id):
     aspect = get_aspect(dem)
     flow_dir = get_flow_direction(aoi)
     flow_acc = get_flow_accumulation(aoi)
-    twi = get_twi(aoi, slope)
 
     statistics = compute_statistics(aoi, dem, slope, aspect)
     if statistics.get("min_elevation") is None:
@@ -399,7 +446,6 @@ def generate_dem(farm_id):
     flow_dir_tile = classify_flow_direction(flow_dir).getMapId(flow_dir_vis)
     # log1p-scaled for display - raw upstream area (km^2) spans orders of magnitude.
     flow_acc_tile = flow_acc.add(1).log().getMapId(FLOW_ACC_VIS)
-    twi_tile = twi.getMapId(TWI_VIS)
 
     return jsonify({
         "farm_id": farm_id,
@@ -412,7 +458,6 @@ def generate_dem(farm_id):
             "aspect": aspect_tile["tile_fetcher"].url_format,
             "flow_direction": flow_dir_tile["tile_fetcher"].url_format,
             "flow_accumulation": flow_acc_tile["tile_fetcher"].url_format,
-            "twi": twi_tile["tile_fetcher"].url_format,
         },
         "legends": {
             "dem": {"vis_params": dem_vis, "labels": DEM_LABELS},
@@ -420,7 +465,6 @@ def generate_dem(farm_id):
             "aspect": {"vis_params": aspect_vis, "labels": ASPECT_LABELS},
             "flow_direction": {"vis_params": flow_dir_vis, "labels": ASPECT_LABELS},
             "flow_accumulation": {"vis_params": FLOW_ACC_VIS, "labels": None},
-            "twi": {"vis_params": TWI_VIS, "labels": TWI_LABELS},
         },
         "statistics": statistics,
     })

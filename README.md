@@ -1,10 +1,10 @@
 # Potato Intel — GEE Indices & Terrain API
 
-A Flask API that computes vegetation/water/radar indices and static terrain
-layers (DEM, slope, aspect, flow direction/accumulation, TWI) from Google
-Earth Engine, returning ready-to-use XYZ tile URLs for map display. Both are
-served from the same app (`api.py`) — one process, one port. Built for
-integration into the Potato Intel platform.
+A Flask API that computes vegetation/water/radar indices and terrain layers
+(DEM, slope, aspect, flow direction/accumulation) from Google Earth Engine,
+returning ready-to-use XYZ tile URLs for map display. Both are served from
+the same app (`api.py`) — one process, one port. Built for integration into
+the Potato Intel platform.
 
 ## Indices
 
@@ -25,6 +25,7 @@ so it varies over time).
 | NDMI | Moisture | Sentinel-2 | `(N - S1) / (N + S1)` |
 | LSWI | Moisture | Sentinel-2 | `(N - S2) / (N + S2)` |
 | SM_RELATIVE | Moisture | Sentinel-1 | Wagner change-detection: temporal min/max normalization of VV backscatter, `[0, 1]` |
+| TWI | Moisture | Sentinel-1 + Copernicus DEM + MERIT Hydro | Seasonal/dynamic: static topographic TWI × `SM_RELATIVE` for the requested date range — see below |
 | TRUE_COLOR | — | Sentinel-2 | RGB composite (visualization only, not a derived index — no classification/legend) |
 
 Band aliases (`N`, `R`, `G`, `B`, `RE1`, `RE2`, `S1`, `S2`, …) map to Sentinel-2
@@ -41,11 +42,52 @@ per group (`VEGETATION_PALETTE`/`VEGETATION_LABELS` or
 `MOISTURE_PALETTE`/`MOISTURE_LABELS`). This is what `/api/index` returns as
 `vis_params` + `labels`.
 
+**"Clouds" (grey, class 10):** every index's palette/labels carries an 11th
+entry — `NO_DATA_CLASS = 10`, color `#808080`, label `"Clouds"` — for pixels
+*inside* the requested AOI that have no valid data on the requested date
+(cloud-masked, shadow, or simply no satellite pass covered that spot/date).
+This is distinct from *outside* the AOI, which always stays fully
+transparent. A date range with **zero** matching scenes at all (e.g. an
+extreme monsoon week, or a 1-day window nothing passed over) used to crash
+with an Earth Engine "Image with no bands" error — `_ensure_bands()` /
+`_ensure_collection()` in `api.py` now guarantee a properly-banded, fully
+masked placeholder in that case, so it flows into the same grey "Clouds"
+rendering instead of failing the request. `TRUE_COLOR` gets the equivalent
+treatment via a grey RGB fill rather than a palette class (see
+`get_true_color()` in `indices.py`).
+
+### Why TWI lives here, not with the static terrain layers
+
+The classic TWI formula (`ln(As / tan(slope))`, in `terrain.get_twi()`) is
+purely topographic — upstream catchment area and slope, both time-invariant.
+On its own it's a static "which spots tend to pool water" map, not something
+tied to a date. But actual wetness also depends on how wet the ground
+currently *is* — the same low-lying spot is only actually wet if it's rained
+recently. So `/api/index`'s `TWI` combines both:
+
+```
+TWI (for a date range) = static_topographic_twi(aoi) × SM_RELATIVE(aoi, start_date, end_date)
+```
+
+`SM_RELATIVE` is the same Sentinel-1-based relative soil moisture index
+already in this table (0–1). A topographically low-lying area only scores
+high TWI here if the requested period was also actually wet; the identical
+terrain in a dry period scores lower. `SM_RELATIVE`'s own masking (no radar
+coverage for that date range) propagates through the multiply, so "no data"
+correctly means "no moisture reading for this period," not "bad terrain
+data" — flowing into the same grey "Clouds" handling as every other index
+(`classify_twi()` in `terrain.py`, not `classify_standard()`, since TWI's
+value range is 0–20 rather than the other indices' roughly 0–1).
+
+Takes the same `orbit_pass` parameter as other Sentinel-1-based indices
+(`NDVI_SAR`, `SM_RELATIVE`).
+
 ## Terrain layers
 
 Computed via `POST /api/farms/<farm_id>/dem/generate` over a farm boundary —
-no date range, since terrain is static (unlike satellite imagery). Full
-request/response details in [Terrain (DEM) API](#terrain-dem-api) below.
+no date range, since these are genuinely static (unlike satellite imagery
+and unlike TWI, which needs a date - see above). Full request/response
+details in [Terrain (DEM) API](#terrain-dem-api) below.
 
 | Layer | Source | What it is |
 |---|---|---|
@@ -54,7 +96,6 @@ request/response details in [Terrain (DEM) API](#terrain-dem-api) below.
 | `aspect` | derived from `dem` | Compass direction the surface faces (8 directions + Flat) |
 | `flow_direction` | MERIT Hydro | D8 flow direction, same 8-compass + Flat scheme as `aspect` |
 | `flow_accumulation` | MERIT Hydro | Upstream drainage area (km²), log-scaled for display |
-| `twi` | derived from `dem` + MERIT Hydro | Topographic Wetness Index, `ln(As / tan(slope))` |
 
 See [`terrain.py`](terrain.py) for the implementation.
 
@@ -64,7 +105,7 @@ See [`terrain.py`](terrain.py) for the implementation.
 Functions/
 ├── api.py                   # Flask API
 ├── indices.py                # Vegetation/moisture/radar index functions + palettes
-├── terrain.py                 # DEM/slope/aspect/flow/TWI terrain functions + palettes
+├── terrain.py                 # DEM/slope/aspect/flow terrain functions + palettes (+ TWI's topographic building block)
 ├── config/
 │   └── ee_auth.py           # GEE service-account auth (initializes on import)
 ├── credentials/
@@ -104,11 +145,13 @@ Liveness check → `{"status": "ok"}`.
 
 ### `GET /api/indices`
 Lists all available index keys, e.g.
-`{"indices": ["EVI", "GNDVI", "LSWI", ..., "TRUE_COLOR"]}`.
+`{"indices": ["EVI", "GNDVI", "LSWI", ..., "TRUE_COLOR", "TWI"]}`.
 
 ### `GET /api/terrain/layers`
-Lists the terrain layer keys returned by the DEM endpoint below:
-`{"layers": ["dem", "slope", "aspect", "flow_direction", "flow_accumulation", "twi"]}`.
+Lists the *static* terrain layer keys returned by the DEM endpoint below
+(`TWI` is date-dependent, so it's listed under `/api/indices` instead - see
+[Why TWI lives here](#why-twi-lives-here-not-with-the-static-terrain-layers)):
+`{"layers": ["dem", "slope", "aspect", "flow_direction", "flow_accumulation"]}`.
 
 ### `POST /api/index`
 Computes one index over an AOI and returns a tile URL for map display.
@@ -138,8 +181,8 @@ Response:
 {
   "index": "NDVI",
   "tile_url": "https://earthengine.googleapis.com/v1/projects/.../tiles/{z}/{x}/{y}",
-  "vis_params": { "min": 0, "max": 9, "palette": ["#8B0000", "..."] },
-  "labels": ["≤ 0.0 | Bare Soil / Water", "..."]
+  "vis_params": { "min": 0, "max": 10, "palette": ["#8B0000", "...", "#808080"] },
+  "labels": ["≤ 0.0 | Bare Soil / Water", "...", "Clouds"]
 }
 ```
 
@@ -172,8 +215,10 @@ No changes to `api.py` are needed beyond that — `/api/indices` and
 ## Terrain (DEM) API
 
 Static terrain layers derived from Copernicus DEM GLO-30 (elevation/slope/
-aspect) and MERIT Hydro (flow direction/accumulation, TWI) — one call per
-farm boundary, no date range (terrain doesn't change like satellite imagery).
+aspect) and MERIT Hydro (flow direction/accumulation) — one call per farm
+boundary, no date range (these don't change like satellite imagery). `TWI`
+is the exception - it's seasonal, so it lives on `/api/index` instead; see
+[Why TWI lives here](#why-twi-lives-here-not-with-the-static-terrain-layers).
 
 ### `POST /api/farms/<farm_id>/dem/generate`
 
@@ -200,16 +245,14 @@ Response:
     "slope": "...",
     "aspect": "...",
     "flow_direction": "...",
-    "flow_accumulation": "...",
-    "twi": "..."
+    "flow_accumulation": "..."
   },
   "legends": {
     "dem": { "vis_params": { "min": 0, "max": 9, "palette": ["#006400", "..."] }, "labels": ["0-100 m | Very Low Elevation", "..."] },
     "slope": { "vis_params": {...}, "labels": ["0-2° | Very Flat", "..."] },
     "aspect": { "vis_params": {...}, "labels": ["North", "North-East", "...", "Flat"] },
     "flow_direction": { "vis_params": {...}, "labels": ["North", "...", "Flat"] },
-    "flow_accumulation": { "vis_params": { "min": 0, "max": 15, "palette": ["#f7fbff", "..."] }, "labels": null },
-    "twi": { "vis_params": {...}, "labels": ["0-2 | Very Low Wetness Tendency", "..."] }
+    "flow_accumulation": { "vis_params": { "min": 0, "max": 15, "palette": ["#f7fbff", "..."] }, "labels": null }
   },
   "statistics": {
     "min_elevation": 589.5,
@@ -237,8 +280,6 @@ each layer's legend on the dashboard toggle list.
   this is a real global hydrological computation, not re-derived per farm
   boundary, so a small field near a large drainage network can correctly
   show high flow accumulation even though the "flow" happens far upstream.
-- `twi` = `ln(As / tan(slope))` per the spec, with `As` = MERIT Hydro's `upa`
-  (converted km² → m²).
 - `flow_direction` and `aspect` share the same 8-compass-direction + "Flat"
   classification/palette (`ASPECT_LABELS`/`ASPECT_PALETTE` in `terrain.py`),
   since both are fundamentally "which way does this pixel face/drain".
@@ -260,16 +301,21 @@ one for a static-per-boundary computation. The split:
   hashing — see `compute_boundary_hash()` in `terrain.py`) and returns it in
   the response so Node can store it as-is.
 - **Node + Postgres** (or whatever the main DB is) owns a `farm_dem_layers`
-  table (`farm_id`, `dem_source`, `dem_resolution`, the 6 `*_raster_url`
-  columns, the statistics columns, `boundary_hash`, `created_at`,
-  `updated_at` — as in the original spec) and implements the actual cache
-  check: hash the incoming boundary the same way, compare to the stored
-  `boundary_hash`, and only call this endpoint when they differ (or none is
-  stored yet). Since GeoJSON round-trips through JSON identically in both
-  languages, hashing the same canonical JSON string in Node (`JSON.stringify`
-  with sorted keys) gives the same hash as this service's Python
-  implementation — reimplement the identical canonicalization on the Node
-  side rather than calling into Python just to get a hash.
+  table (`farm_id`, `dem_source`, `dem_resolution`, the 5 `*_raster_url`
+  columns for the genuinely static layers, the statistics columns,
+  `boundary_hash`, `created_at`, `updated_at` — as in the original spec, minus
+  `twi` which is no longer part of this static payload) and implements the
+  actual cache check: hash the incoming boundary the same way, compare to the
+  stored `boundary_hash`, and only call this endpoint when they differ (or
+  none is stored yet). Since GeoJSON round-trips through JSON identically in
+  both languages, hashing the same canonical JSON string in Node
+  (`JSON.stringify` with sorted keys) gives the same hash as this service's
+  Python implementation — reimplement the identical canonicalization on the
+  Node side rather than calling into Python just to get a hash.
+  `TWI` (from `/api/index`) is date-dependent and isn't a good fit for this
+  same per-boundary cache - if you want to cache it too, key it by
+  `(farm_id, start_date, end_date)` instead, same as you would for any other
+  `/api/index` result.
 
 ## Integrating with a Node.js backend
 
@@ -362,7 +408,6 @@ app.post('/api/fields/:fieldId/terrain', async (req, res) => {
     aspect_raster_url: data.layers.aspect,
     flow_direction_raster_url: data.layers.flow_direction,
     flow_accumulation_raster_url: data.layers.flow_accumulation,
-    twi_raster_url: data.layers.twi,
     min_elevation: data.statistics.min_elevation,
     max_elevation: data.statistics.max_elevation,
     avg_elevation: data.statistics.avg_elevation,
