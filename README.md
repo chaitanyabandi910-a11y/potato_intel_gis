@@ -140,6 +140,28 @@ server — for production, run behind a real WSGI server (gunicorn, etc.), see
 
 ## API
 
+All of this is one Flask app, one host:port — there's no separate service to
+stand up per feature. But it is **not** one single route: there are 5
+distinct paths, and calling the wrong one for a given key is a real failure
+mode, not just a style choice.
+
+| Route | Method | Use for |
+|---|---|---|
+| `/health` | GET | Liveness check |
+| `/api/indices` | GET | List valid `index` values for `/api/index` |
+| `/api/index` | POST | Any of the 13 vegetation/moisture/radar/TWI keys — needs `aoi` + `start_date`/`end_date` |
+| `/api/terrain/layers` | GET | List the 5 static terrain layer keys |
+| `/api/farms/<farm_id>/dem/generate` | POST | The 5 static terrain layers — needs `boundary`, no dates |
+
+**Route by type, don't send everything to `/api/index`.** `DEM`/`SLOPE`/
+`ASPECT`/`FLOW_DIRECTION`/`FLOW_ACCUMULATION` don't exist in `/api/index`'s
+catalog at all — sending one there gets a 400 "Unknown index," not a
+graceful fallback. If your frontend has one unified dropdown mixing indices
+and terrain layers, your backend needs to branch on which type was selected
+and call the matching route; it can't forward the selection blindly to a
+single endpoint. (This exact mismatch was the root cause the one time this
+showed up as terrain layers rendering "No images" in a caller's frontend.)
+
 ### `GET /health`
 Liveness check → `{"status": "ok"}`.
 
